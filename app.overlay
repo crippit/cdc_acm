@@ -1,0 +1,86 @@
+/* app.overlay */
+
+&clock {
+    status = "okay";
+    hfclkaudio-frequency = <12288000>;
+};
+
+&pinctrl {
+    i2c1_default: i2c1_default {
+        group1 {
+            /* I2C Pins -> Avoids UART collision */
+            psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,  /* nRF P0.26 -> Teensy Pin 18 */
+                    <NRF_PSEL(TWIM_SCL, 0, 27)>;  /* nRF P0.27 -> Teensy Pin 19 */
+            bias-pull-up;
+        };
+    };
+
+    i2c1_sleep: i2c1_sleep {
+        group1 {
+            psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,
+                    <NRF_PSEL(TWIM_SCL, 0, 27)>;
+            low-power-enable;
+        };
+    };
+
+    i2s0_default: i2s0_default {
+        group1 {
+            /* Clock Pins -> Avoids UART collision */
+            psels = <NRF_PSEL(I2S_SCK_M, 0, 4)>,   /* nRF P0.04 -> Teensy Pin 21 */
+                    <NRF_PSEL(I2S_LRCK_M, 0, 5)>,  /* nRF P0.05 -> Teensy Pin 20 */
+                    <NRF_PSEL(I2S_MCK, 0, 7)>;     /* nRF P0.07 -> Teensy Pin 23 */
+            nordic,drive-mode = <NRF_DRIVE_H0H1>;
+        };
+        group2 {
+            /* FIXED: Swapped to properly route TX to RX */
+            psels = <NRF_PSEL(I2S_SDIN, 0, 8)>,    /* nRF P0.08 now listens to SGTL5000 TX (Teensy Pin 7) */
+                    <NRF_PSEL(I2S_SDOUT, 0, 6)>;   /* nRF P0.06 now drives SGTL5000 RX (Teensy Pin 8) */
+        };
+    };
+
+    i2s0_sleep: i2s0_sleep {
+        group1 {
+            psels = <NRF_PSEL(I2S_SCK_M, 0, 4)>,
+                    <NRF_PSEL(I2S_LRCK_M, 0, 5)>,
+                    <NRF_PSEL(I2S_MCK, 0, 7)>,
+                    <NRF_PSEL(I2S_SDIN, 0, 8)>,
+                    <NRF_PSEL(I2S_SDOUT, 0, 6)>;
+            low-power-enable;
+        };
+    };
+};
+
+&i2c1 {
+    status = "okay";
+    pinctrl-0 = <&i2c1_default>;
+    pinctrl-1 = <&i2c1_sleep>;
+    pinctrl-names = "default", "sleep";
+
+    sgtl5000: sgtl5000@a {
+        compatible = "nxp,sgtl5000";
+        reg = <0x0a>;
+        #sound-dai-cells = <0>;
+        status = "okay";
+    };
+};
+
+&i2s0 {
+    status = "okay";
+    pinctrl-0 = <&i2s0_default>;
+    pinctrl-1 = <&i2s0_sleep>;
+    pinctrl-names = "default", "sleep";
+    clock-source = "ACLK";
+};
+
+/* --- USB Microphone (48kHz Stereo) --- */
+&usbd {
+    status = "okay";
+    mic_0: mic_0 {
+        compatible = "usb-audio-mic";
+        status = "okay";
+        feature-mute;
+        channel-l;
+        channel-r;
+        sample-rate-hz = <48000>;
+    };
+};
