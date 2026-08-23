@@ -200,28 +200,21 @@ void audio_router_thread(void *p1, void *p2, void *p3)
     k_sem_take(&hardware_ready_sem, K_FOREVER);
     
     while (1) {
-        if (request_input_switch) {
-            request_input_switch = false;
-            is_line_active = !is_line_active;
-            gpio_pin_set_dt(&led_line, is_line_active ? 1 : 0);  
-            gpio_pin_set_dt(&led_mic, is_line_active ? 0 : 1);   
-        }
-
         if (i2s_read(i2s_dev, &rx_mem_block, &rx_size) == 0) {
             if (rx_size == STEREO_BLOCK_SIZE) {
-                if (is_line_active) {
-                    int16_t *stereo_in = (int16_t *)rx_mem_block;
-                    if (ring_buf_space_get(&audio_ringbuf) >= rx_size) {
-                        ring_buf_put(&audio_ringbuf, (uint8_t *)stereo_in, rx_size);
-                    }
-                    for (int i = 0; i < SAMPLES_PER_FRAME; i++) {
-                        int32_t sum = (stereo_in[i * 2] + stereo_in[i * 2 + 1]) / 2;
-                        if (sum > 32767) sum = 32767;
-                        else if (sum < -32768) sum = -32768;
-                        mono_temp[i] = (int16_t)sum; 
-                    }
-                } else {
-                    memset(mono_temp, 0, sizeof(mono_temp));
+                int16_t *stereo_in = (int16_t *)rx_mem_block;
+                
+                /* 1. ALWAYS feed the USB ring buffer */
+                if (ring_buf_space_get(&audio_ringbuf) >= rx_size) {
+                    ring_buf_put(&audio_ringbuf, (uint8_t *)stereo_in, rx_size);
+                }
+                
+                /* 2. ALWAYS mix down for Auracast (L+R / 2) */
+                for (int i = 0; i < SAMPLES_PER_FRAME; i++) {
+                    int32_t sum = (stereo_in[i * 2] + stereo_in[i * 2 + 1]) / 2;
+                    if (sum > 32767) sum = 32767;
+                    else if (sum < -32768) sum = -32768;
+                    mono_temp[i] = (int16_t)sum; 
                 }
             }
             k_mem_slab_free(&i2s_rx_slab, rx_mem_block);
@@ -232,7 +225,11 @@ void audio_router_thread(void *p1, void *p2, void *p3)
         
         uint16_t current_seq = seq_num++;
         
-        /* EXPERT FIX: Stereo Spoof (Encode Mono once, duplicate payload to 2 BIS streams) */
+        /* 3. Send to Auracast */
+        /* 3. Send to Auracast */
+        static int bap_err_count = 0;
+        static int success_count = 0;
+
         if (streams[0].ep != NULL && streams[1].ep != NULL && lc3_encoder != NULL) {
             struct net_buf *buf_left = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
             struct net_buf *buf_right = net_buf_alloc(&bis_tx_pool, K_NO_WAIT);
@@ -243,16 +240,21 @@ void audio_router_thread(void *p1, void *p2, void *p3)
                 
                 uint8_t *enc_data = net_buf_add(buf_left, 100);
                 lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mono_temp, 1, 100, enc_data);
-                
                 memcpy(net_buf_add(buf_right, 100), enc_data, 100);
                 
-                if (bt_bap_stream_send(&streams[0], buf_left, current_seq) < 0) {
+                int err_l = bt_bap_stream_send(&streams[0], buf_left, current_seq);
+                if (err_l < 0) {
+                    if (bap_err_count++ % 100 == 0) LOG_WRN("BAP Send Error (Left): %d", err_l);
                     net_buf_unref(buf_left);
+                } else {
+                    if (success_count++ % 500 == 0) LOG_INF("BAP Packets successfully sent to radio.");
                 }
-                if (bt_bap_stream_send(&streams[1], buf_right, current_seq) < 0) {
-                    net_buf_unref(buf_right);
-                }
+
+                int err_r = bt_bap_stream_send(&streams[1], buf_right, current_seq);
+                if (err_r < 0) net_buf_unref(buf_right);
+                
             } else {
+                if (bap_err_count++ % 100 == 0) LOG_WRN("BAP TX Pool Empty! Cannot allocate buffers.");
                 if (buf_left) net_buf_unref(buf_left);
                 if (buf_right) net_buf_unref(buf_right);
             }
@@ -293,10 +295,21 @@ void start_zip_auracast(void)
     memcpy(lc3_codec_cfg.meta, custom_metadata, sizeof(custom_metadata));
     lc3_codec_cfg.meta_len = sizeof(custom_metadata);
 
-    /* EXPERT FIX: Declare 2 Streams in the subgroup */
+   /* EXPERT FIX: Explicitly tag Stream 0 as Left and Stream 1 as Right for Android PACS */
+    static uint8_t left_bis_data[]  = { 5, 0x03, 0x01, 0x00, 0x00, 0x00 }; 
+    static uint8_t right_bis_data[] = { 5, 0x03, 0x02, 0x00, 0x00, 0x00 }; 
+
     struct bt_bap_broadcast_source_stream_param stream_params[2] = {
-        { .stream = &streams[0] },
-        { .stream = &streams[1] }
+        { 
+            .stream = &streams[0], 
+            .data_len = ARRAY_SIZE(left_bis_data), 
+            .data = left_bis_data 
+        },
+        { 
+            .stream = &streams[1], 
+            .data_len = ARRAY_SIZE(right_bis_data), 
+            .data = right_bis_data 
+        }
     };
     struct bt_bap_broadcast_source_subgroup_param subgroup_param = {
         .params_count = 2, 
@@ -359,10 +372,7 @@ int main(void)
     NRF_CLOCK->TASKS_HFCLKAUDIOSTART = 1;
     while (NRF_CLOCK->EVENTS_HFCLKAUDIOSTARTED == 0) {}
     
-    /* 1. Wake Codec FIRST */
-    wake_sgtl5000();
-
-    /* 2. Configure I2S: nRF5340 acts as Master to generate MCLK for SGTL5000 */
+    /* 1. Configure and Start I2S FIRST to generate the MCLK heartbeat */
     struct i2s_config i2s_cfg = {
         .word_size = 16, 
         .channels = 2,   
@@ -377,15 +387,20 @@ int main(void)
     i2s_configure(i2s_dev, I2S_DIR_RX, &i2s_cfg);
     i2s_trigger(i2s_dev, I2S_DIR_RX, I2S_TRIGGER_START);
     
-    /* 3. Bring up USB */
+    /* 2. THE FIX: Release the audio thread NOW. 
+          It will continuously drain the I2S queue in the background,
+          completely preventing the "No room in RX queue" memory leak. */
+    k_sem_give(&hardware_ready_sem);
+    
+    /* 3. Wake the Codec (The 450ms boot delay is now safely absorbed) */
+    wake_sgtl5000();
+
+    /* 4. Bring up USB */
     mic_dev = DEVICE_DT_GET_ONE(usb_audio_mic);
     usb_audio_register((struct device *)mic_dev, &usb_ops);
     usb_enable(NULL);
 
-    /* 4. Unblock Audio Thread */
-    k_sem_give(&hardware_ready_sem);
-
-    /* 5. Start Bluetooth */
+    /* 5. Start Bluetooth & Auracast */
     bt_enable(NULL);
     bt_bap_stream_cb_register(&streams[0], &stream_ops);
     bt_bap_stream_cb_register(&streams[1], &stream_ops);
